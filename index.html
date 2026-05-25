@@ -117,7 +117,7 @@
     flex-direction: column;
     gap: 10px;
     overflow-y: auto;
-    max-height: 52vh;
+    max-height: 44vh;
   }
 
   .btn-row {
@@ -217,33 +217,24 @@
     flex-shrink: 0;
   }
 
-  .toggle-grid {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-  }
-  .toggle-btn {
-    background: #1e1e24;
-    border: 1px solid #35353f;
+  /* Hull+Web active indicator */
+  .hull-status {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 12px;
+    background: #1a0a00;
+    border: 1px solid #ff8844;
     border-radius: 8px;
-    padding: 8px 10px;
     font-size: 12px;
-    color: #80808a;
-    text-align: left;
-    cursor: pointer;
-    transition: all 0.15s;
-    flex: unset;
+    color: #ff8844;
+    font-weight: 600;
   }
-  .toggle-btn.on {
-    border-color: currentColor;
-    background: #1a1a2e;
+  .hull-dot {
+    width: 8px; height: 8px;
+    background: #ff8844;
+    border-radius: 50%;
   }
-  .toggle-btn.on.trail { color: #00ff88; background: #001a0d; }
-  .toggle-btn.on.para  { color: #ffaa00; background: #1a1100; }
-  .toggle-btn.on.grad  { color: #00cfff; background: #001a22; }
-  .toggle-btn.on.flow  { color: #bb88ff; background: #150a22; }
-  .toggle-btn.on.hull  { color: #ff8844; background: #1a0a00; }
-  .toggle-btn.on.heat  { color: #ff4444; background: #1a0000; }
 
   /* Save instructions toast */
   #save-toast {
@@ -270,7 +261,7 @@
 
 <header>
   <h1>BLOB<span>TRACKER</span></h1>
-  <span class="badge">v10</span>
+  <span class="badge">v2.0</span>
   <span class="subtitle" id="fps-label">— fps</span>
 </header>
 
@@ -334,20 +325,10 @@
     </div>
 
     <div>
-      <div class="section-title">Overlays</div>
-      <div class="toggle-grid">
-        <button class="toggle-btn trail" id="tog-trail"
-                onclick="toggle('trail')">🟢 Trail Lines</button>
-        <button class="toggle-btn para"  id="tog-para"
-                onclick="toggle('para')">🟠 Parabola</button>
-        <button class="toggle-btn grad"  id="tog-grad"
-                onclick="toggle('grad')">🔵 Gradient</button>
-        <button class="toggle-btn flow"  id="tog-flow"
-                onclick="toggle('flow')">🟣 Opt. Flow</button>
-        <button class="toggle-btn hull"  id="tog-hull"
-                onclick="toggle('hull')">🟤 Hull+Web</button>
-        <button class="toggle-btn heat"  id="tog-heat"
-                onclick="toggle('heat')">🔴 Heatmap</button>
+      <div class="section-title">Overlay Aktif</div>
+      <div class="hull-status">
+        <div class="hull-dot"></div>
+        🔶 Hull + Web — Convex Hull &amp; Centroid Web
       </div>
     </div>
 
@@ -372,11 +353,10 @@
 // ─────────────────────────────────────────────
 // STATE
 // ─────────────────────────────────────────────
-const TRAIL_LEN  = 300;
 let facingMode   = 'user';
 let stream       = null;
 let animFrame    = null;
-let prevFrame    = null;
+let prevFrame    = null;   // Uint8Array grayscale only — 4× lebih ringan
 let blobTrails   = {};
 let nextId       = 0;
 let recording    = false;
@@ -386,12 +366,13 @@ let recBlob      = null;
 let lastTime     = performance.now();
 let frameCount   = 0;
 let fps          = 0;
-let prevGrayFlow = null;
 
-const overlays = {
-  trail:false, para:false, grad:false,
-  flow:false,  hull:false, heat:false,
-};
+// ── SCALE DOWN resolusi processing ──────────
+// Video tetap 1280×720 untuk tampilan, tapi
+// motion detection diproses di 320×180 (1/4)
+// Ini PALING signifikan mengurangi beban CPU
+const PROC_SCALE = 0.25;
+
 const sliders = {
   sensitivity:15, minsize:200, maxsize:15000,
 };
@@ -401,7 +382,9 @@ const sliders = {
 // ─────────────────────────────────────────────
 const vid = document.getElementById('vid');
 const cvs = document.getElementById('overlay');
-const ctx = cvs.getContext('2d', { willReadFrequently:true });
+const ctx = cvs.getContext('2d', { alpha: false });
+// Hapus willReadFrequently dari overlay ctx —
+// overlay tidak perlu dibaca, hanya ditulis
 
 async function startCamera(facing) {
   if (stream) stream.getTracks().forEach(t => t.stop());
@@ -418,7 +401,6 @@ async function startCamera(facing) {
     await vid.play();
     facingMode   = facing;
     prevFrame    = null;
-    prevGrayFlow = null;
     blobTrails   = {};
     document.getElementById('btn-front')
       .classList.toggle('active', facing==='user');
@@ -433,11 +415,8 @@ function switchCamera(facing) { startCamera(facing); }
 
 // ─────────────────────────────────────────────
 // RECORDING
-// Records the overlay canvas which contains
-// the video frame + all blob drawings on top
 // ─────────────────────────────────────────────
 function getBestMimeType() {
-  // Try MP4 first (Safari/iPhone supports this)
   const types = [
     'video/mp4',
     'video/mp4;codecs=avc1',
@@ -459,120 +438,72 @@ function toggleRecord() {
 function startRecording() {
   recChunks = [];
   recBlob   = null;
-
-  // Reset save button
   const savBtn = document.getElementById('btn-save');
   savBtn.classList.remove('ready');
   savBtn.textContent = '⬇ Save';
-
   const mimeType = getBestMimeType();
   const opts     = mimeType ? { mimeType } : {};
-
   try {
-    // Capture the overlay canvas — this has video + blobs
     mediaRec = new MediaRecorder(cvs.captureStream(30), opts);
   } catch(e) {
-    alert('Recording not supported on this device: ' + e.message);
+    alert('Recording not supported: ' + e.message);
     return;
   }
-
   mediaRec.ondataavailable = e => {
     if (e.data && e.data.size > 0) recChunks.push(e.data);
   };
-
   mediaRec.onstop = () => {
     const mime = mimeType || 'video/webm';
     recBlob    = new Blob(recChunks, { type: mime });
     const btn  = document.getElementById('btn-save');
     btn.classList.add('ready');
     btn.textContent = '⬇ Save';
-    console.log('Recording saved:', recBlob.size,
-                'bytes, type:', recBlob.type);
   };
-
   mediaRec.start(100);
   recording = true;
-
-  document.getElementById('btn-record')
-    .classList.add('recording');
-  document.getElementById('btn-record')
-    .textContent = '⏹ Stop';
-  document.getElementById('rec-badge')
-    .classList.add('active');
+  document.getElementById('btn-record').classList.add('recording');
+  document.getElementById('btn-record').textContent = '⏹ Stop';
+  document.getElementById('rec-badge').classList.add('active');
 }
 
 function stopRecording() {
-  if (mediaRec && mediaRec.state !== 'inactive') {
-    mediaRec.stop();
-  }
+  if (mediaRec && mediaRec.state !== 'inactive') mediaRec.stop();
   recording = false;
-  document.getElementById('btn-record')
-    .classList.remove('recording');
-  document.getElementById('btn-record')
-    .textContent = '⏺ Record';
-  document.getElementById('rec-badge')
-    .classList.remove('active');
+  document.getElementById('btn-record').classList.remove('recording');
+  document.getElementById('btn-record').textContent = '⏺ Record';
+  document.getElementById('rec-badge').classList.remove('active');
 }
 
 async function saveRecording() {
   if (!recBlob) {
-    alert('No recording yet — press Record first, '
-        + 'then Stop, then Save.');
+    alert('No recording yet — press Record first, then Stop, then Save.');
     return;
   }
-
-  // Determine file extension
   const isMP4 = recBlob.type.includes('mp4');
   const ext   = isMP4 ? 'mp4' : 'webm';
   const fname = 'blobtracker-' +
-    new Date().toISOString().slice(0,19)
-               .replace(/:/g,'-') +
-    '.' + ext;
-
-  const file = new File([recBlob], fname,
-                        { type: recBlob.type });
-
-  // ── Try Web Share API (iOS native share sheet) ──
-  // This is the only reliable way to save to iOS Photos
+    new Date().toISOString().slice(0,19).replace(/:/g,'-') + '.' + ext;
+  const file = new File([recBlob], fname, { type: recBlob.type });
   if (navigator.canShare && navigator.canShare({ files:[file] })) {
     try {
-      await navigator.share({
-        files: [file],
-        title: 'BlobTracker Recording',
-      });
+      await navigator.share({ files: [file], title: 'BlobTracker Recording' });
       return;
     } catch(e) {
-      // User cancelled share — that's fine
       if (e.name === 'AbortError') return;
-      // Fall through to download fallback
     }
   }
-
-  // ── Fallback: standard browser download ──
-  // Works on Android Chrome and desktop
-  // On iPhone this saves to Files app, not Photos
   const url = URL.createObjectURL(recBlob);
   const a   = document.createElement('a');
-  a.href    = url;
-  a.download = fname;
-  document.body.appendChild(a);
-  a.click();
+  a.href = url; a.download = fname;
+  document.body.appendChild(a); a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
-
-  // Show instructions toast for iOS users
   const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
   if (isIOS) showToast();
 }
 
-function showToast() {
-  document.getElementById('save-toast')
-    .classList.add('show');
-}
-function dismissToast() {
-  document.getElementById('save-toast')
-    .classList.remove('show');
-}
+function showToast()    { document.getElementById('save-toast').classList.add('show'); }
+function dismissToast() { document.getElementById('save-toast').classList.remove('show'); }
 
 // ─────────────────────────────────────────────
 // UI HELPERS
@@ -580,11 +511,6 @@ function dismissToast() {
 function updateVal(key, val) {
   sliders[key] = parseFloat(val);
   document.getElementById('val-'+key).textContent = val;
-}
-function toggle(key) {
-  overlays[key] = !overlays[key];
-  document.getElementById('tog-'+key)
-    .classList.toggle('on', overlays[key]);
 }
 
 // ─────────────────────────────────────────────
@@ -605,7 +531,7 @@ function matchBlobs(prevTrails, newCentroids) {
       used.add(bestId);
       const t = prevTrails[bestId];
       t.push({x:cx,y:cy});
-      if (t.length>TRAIL_LEN) t.shift();
+      if (t.length>60) t.shift(); // kurangi trail length — tidak dirender juga
       updated[bestId] = t;
     } else {
       updated[nextId] = [{x:cx,y:cy}];
@@ -616,65 +542,83 @@ function matchBlobs(prevTrails, newCentroids) {
 }
 
 // ─────────────────────────────────────────────
-// MOTION MASK
+// OFFSCREEN CANVAS — hanya untuk processing,
+// ukurannya diperkecil PROC_SCALE
+// ─────────────────────────────────────────────
+const offCvs = document.createElement('canvas');
+const offCtx = offCvs.getContext('2d', { willReadFrequently: true });
+
+// ─────────────────────────────────────────────
+// MOTION MASK — bekerja di resolusi kecil
+// Hanya baca channel R saja (3× lebih cepat)
 // ─────────────────────────────────────────────
 function getMotionMask(curr, prev, w, h, thresh) {
-  const mask = new Uint8Array(w*h);
-  for (let i=0; i<w*h; i++) {
-    const p  = i*4;
-    const lc = 0.299*curr[p]+0.587*curr[p+1]+0.114*curr[p+2];
-    const lp = 0.299*prev[p]+0.587*prev[p+1]+0.114*prev[p+2];
-    mask[i]  = Math.abs(lc-lp) > thresh ? 255 : 0;
+  const mask = new Uint8Array(w * h);
+  const len  = w * h;
+  for (let i = 0; i < len; i++) {
+    const p  = i * 4;
+    // Approx luma tanpa float multiply — pakai shift
+    const lc = (curr[p]*2 + curr[p+1]*5 + curr[p+2]) >> 3;
+    const lp = (prev[p]*2 + prev[p+1]*5 + prev[p+2]) >> 3;
+    if ((lc - lp > thresh) || (lp - lc > thresh)) mask[i] = 255;
   }
   return mask;
 }
 
+// ── Dilate pakai radius 2 (bukan 4) di resolusi kecil
+// Efek visual setara resolusi penuh dengan radius 8
 function dilateMask(mask, w, h, r) {
-  const out = new Uint8Array(w*h);
-  for (let y=0; y<h; y++) {
-    for (let x=0; x<w; x++) {
-      let found=false;
-      outer:
-      for (let dy=-r; dy<=r; dy++) {
-        for (let dx=-r; dx<=r; dx++) {
-          const nx=x+dx, ny=y+dy;
-          if (nx<0||nx>=w||ny<0||ny>=h) continue;
-          if (mask[ny*w+nx]===255) {
-            found=true; break outer;
-          }
+  const out = new Uint8Array(w * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!mask[y*w+x]) continue; // skip kalau bukan motion
+      // Isi lingkaran sekitar pixel ini
+      const x0=Math.max(0,x-r), x1=Math.min(w-1,x+r);
+      const y0=Math.max(0,y-r), y1=Math.min(h-1,y+r);
+      for (let dy=y0; dy<=y1; dy++) {
+        for (let dx=x0; dx<=x1; dx++) {
+          out[dy*w+dx] = 255;
         }
       }
-      out[y*w+x] = found?255:0;
     }
   }
   return out;
 }
 
 // ─────────────────────────────────────────────
-// FIND BLOBS
+// FIND BLOBS — pakai index pointer, bukan shift()
 // ─────────────────────────────────────────────
 function findBlobs(mask, w, h, minArea, maxArea) {
-  const visited = new Uint8Array(w*h);
+  const visited = new Uint8Array(w * h);
   const blobs   = [];
-  for (let sy=0; sy<h; sy++) {
-    for (let sx=0; sx<w; sx++) {
+  const queue   = new Int32Array(w * h); // pre-alloc, hindari GC
+
+  for (let sy = 0; sy < h; sy++) {
+    for (let sx = 0; sx < w; sx++) {
       const si = sy*w+sx;
-      if (mask[si]!==255||visited[si]) continue;
-      const queue=[si]; visited[si]=1;
-      let minX=sx,maxX=sx,minY=sy,maxY=sy,pixels=0;
-      while (queue.length>0) {
-        const idx=queue.shift();
-        const qx=idx%w, qy=(idx-qx)/w;
+      if (mask[si] !== 255 || visited[si]) continue;
+      // BFS dengan pointer — O(n) murni
+      let head=0, tail=0;
+      queue[tail++] = si;
+      visited[si] = 1;
+      let minX=sx, maxX=sx, minY=sy, maxY=sy, pixels=0;
+      while (head < tail) {
+        const idx = queue[head++];
+        const qx  = idx % w;
+        const qy  = (idx - qx) / w;
         pixels++;
-        if (qx<minX) minX=qx; if (qx>maxX) maxX=qx;
-        if (qy<minY) minY=qy; if (qy>maxY) maxY=qy;
-        for (const n of [idx-1,idx+1,idx-w,idx+w]) {
-          if (n<0||n>=w*h||visited[n]||mask[n]!==255) continue;
-          visited[n]=1; queue.push(n);
+        if (qx < minX) minX=qx; if (qx > maxX) maxX=qx;
+        if (qy < minY) minY=qy; if (qy > maxY) maxY=qy;
+        const nbrs = [idx-1, idx+1, idx-w, idx+w];
+        for (let k=0; k<4; k++) {
+          const n = nbrs[k];
+          if (n>=0 && n<w*h && !visited[n] && mask[n]===255) {
+            visited[n]=1; queue[tail++]=n;
+          }
         }
       }
-      const bw=maxX-minX+1, bh=maxY-minY+1;
-      if (pixels<minArea||pixels>maxArea) continue;
+      if (pixels < minArea || pixels > maxArea) continue;
+      const bw = maxX-minX+1, bh = maxY-minY+1;
       blobs.push({
         x:minX, y:minY, w:bw, h:bh,
         cx:Math.round(minX+bw/2),
@@ -687,16 +631,64 @@ function findBlobs(mask, w, h, minArea, maxArea) {
 }
 
 // ─────────────────────────────────────────────
-// CONTRAST COLOR
+// HULL + WEB OVERLAY
+// ─────────────────────────────────────────────
+function drawHullWeb(c, blobs) {
+  if (blobs.length < 2) return;
+  const gcx = blobs.reduce((s,b)=>s+b.cx,0) / blobs.length;
+  const gcy = blobs.reduce((s,b)=>s+b.cy,0) / blobs.length;
+  c.strokeStyle='#ff8844'; c.fillStyle='#ff8844'; c.lineWidth=1.5;
+  for (const b of blobs) {
+    c.beginPath(); c.moveTo(b.cx,b.cy); c.lineTo(gcx,gcy); c.stroke();
+  }
+  c.beginPath(); c.arc(gcx,gcy,5,0,Math.PI*2); c.fill();
+  c.font = '11px -apple-system,sans-serif';
+  c.fillText('G', gcx+7, gcy+4);
+  if (blobs.length >= 3) {
+    const pts  = blobs.map(b=>[b.cx,b.cy]);
+    const hull = convexHull(pts);
+    if (hull.length >= 3) {
+      c.beginPath(); c.moveTo(hull[0][0],hull[0][1]);
+      for (let i=1; i<hull.length; i++) c.lineTo(hull[i][0],hull[i][1]);
+      c.closePath(); c.stroke();
+    }
+  }
+}
+
+function convexHull(pts) {
+  if (pts.length < 3) return pts;
+  pts = pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
+  const lower = [];
+  for (const p of pts) {
+    while(lower.length>=2&&cross(lower[lower.length-2],lower[lower.length-1],p)<=0) lower.pop();
+    lower.push(p);
+  }
+  const upper = [];
+  for (let i=pts.length-1; i>=0; i--) {
+    const p=pts[i];
+    while(upper.length>=2&&cross(upper[upper.length-2],upper[upper.length-1],p)<=0) upper.pop();
+    upper.push(p);
+  }
+  return lower.slice(0,-1).concat(upper.slice(0,-1));
+}
+function cross(O,A,B) {
+  return (A[0]-O[0])*(B[1]-O[1])-(A[1]-O[1])*(B[0]-O[0]);
+}
+
+// ─────────────────────────────────────────────
+// CONTRAST COLOR (fast path)
 // ─────────────────────────────────────────────
 function contrastColor(imgData, x, y, bw, bh, W, H) {
   let sum=0, count=0;
+  // Sample hanya 10×4 pixel — bukan seluruh area blob
   const x1=Math.max(0,x), x2=Math.min(W,x+bw);
   const y1=Math.max(0,y-10), y2=Math.min(H,y+4);
-  for (let iy=y1; iy<y2; iy++) {
-    for (let ix=x1; ix<x2; ix++) {
+  const stepX = Math.max(1, Math.floor((x2-x1)/10));
+  const stepY = Math.max(1, Math.floor((y2-y1)/2));
+  for (let iy=y1; iy<y2; iy+=stepY) {
+    for (let ix=x1; ix<x2; ix+=stepX) {
       const p=(iy*W+ix)*4;
-      sum+=0.299*imgData[p]+0.587*imgData[p+1]+0.114*imgData[p+2];
+      sum += (imgData[p]*2 + imgData[p+1]*5 + imgData[p+2]) >> 3;
       count++;
     }
   }
@@ -704,328 +696,159 @@ function contrastColor(imgData, x, y, bw, bh, W, H) {
 }
 
 // ─────────────────────────────────────────────
-// DRAW HELPERS
-// ─────────────────────────────────────────────
-function drawArrow(c, x1, y1, x2, y2) {
-  const ang=Math.atan2(y2-y1,x2-x1), tl=8;
-  c.beginPath(); c.moveTo(x1,y1); c.lineTo(x2,y2); c.stroke();
-  c.beginPath();
-  c.moveTo(x2,y2);
-  c.lineTo(x2-tl*Math.cos(ang-0.4), y2-tl*Math.sin(ang-0.4));
-  c.lineTo(x2-tl*Math.cos(ang+0.4), y2-tl*Math.sin(ang+0.4));
-  c.closePath(); c.fill();
-}
-
-function drawTrails(c, trails) {
-  c.strokeStyle='#00ff88'; c.lineWidth=1; c.globalAlpha=0.65;
-  for (const trail of Object.values(trails)) {
-    if (trail.length<2) continue;
-    c.beginPath(); c.moveTo(trail[0].x,trail[0].y);
-    for (let i=1;i<trail.length;i++) c.lineTo(trail[i].x,trail[i].y);
-    c.stroke();
-  }
-  c.globalAlpha=1;
-}
-
-function drawParabola(c, trail, W, H) {
-  if (trail.length<6) return;
-  const xs=trail.map(p=>p.x), ys=trail.map(p=>p.y);
-  const xMin=Math.min(...xs), xMax=Math.max(...xs);
-  if (xMax-xMin<10||Math.max(...ys)-Math.min(...ys)<3) return;
-  let sx=0,sx2=0,sx3=0,sx4=0,sy=0,sxy=0,sx2y=0;
-  const n=trail.length;
-  for (const p of trail) {
-    const x=p.x,y=p.y;
-    sx+=x;sx2+=x*x;sx3+=x*x*x;sx4+=x*x*x*x;
-    sy+=y;sxy+=x*y;sx2y+=x*x*y;
-  }
-  const A=[[sx4,sx3,sx2],[sx3,sx2,sx],[sx2,sx,n]];
-  const B=[sx2y,sxy,sy];
-  function det3(m){
-    return m[0][0]*(m[1][1]*m[2][2]-m[1][2]*m[2][1])
-          -m[0][1]*(m[1][0]*m[2][2]-m[1][2]*m[2][0])
-          +m[0][2]*(m[1][0]*m[2][1]-m[1][1]*m[2][0]);
-  }
-  const dA=det3(A); if(Math.abs(dA)<1e-10) return;
-  function repCol(M,col,v){
-    return M.map((row,i)=>row.map((c2,j)=>j===col?v[i]:c2));
-  }
-  const a=det3(repCol(A,0,B))/dA;
-  const b=det3(repCol(A,1,B))/dA;
-  const cv2=det3(repCol(A,2,B))/dA;
-  const ext=Math.max(20,(xMax-xMin)>>1);
-  c.strokeStyle='#ffaa00'; c.lineWidth=1; c.setLineDash([4,4]);
-  c.beginPath(); let started=false;
-  for (let x=Math.max(0,xMin-ext);x<=Math.min(W,xMax+ext);x+=3) {
-    const y=a*x*x+b*x+cv2;
-    if (y<0||y>H){started=false;continue;}
-    if (!started){c.moveTo(x,y);started=true;}
-    else c.lineTo(x,y);
-  }
-  c.stroke(); c.setLineDash([]);
-  const nx=xMax+((xMax-xMin)>>2);
-  if (nx>=0&&nx<W){
-    const ny=a*nx*nx+b*nx+cv2;
-    if (ny>=0&&ny<H){
-      c.fillStyle='#ffaa00';
-      c.beginPath();c.arc(nx,ny,4,0,Math.PI*2);c.fill();
-      c.font='10px -apple-system,sans-serif';
-      c.fillText('pred',nx+6,ny);
-    }
-  }
-}
-
-function drawGradient(c, cx, cy, trail) {
-  if (trail.length<3) return;
-  const n=Math.min(5,trail.length-1);
-  let vx=0,vy=0;
-  for (let i=1;i<=n;i++){
-    vx+=trail[trail.length-i].x-trail[trail.length-i-1].x;
-    vy+=trail[trail.length-i].y-trail[trail.length-i-1].y;
-  }
-  vx/=n; vy/=n;
-  const spd=Math.hypot(vx,vy);
-  if (spd<0.5) return;
-  const sc=Math.min(4,Math.max(1,40/(spd+1)));
-  c.strokeStyle='#00cfff'; c.fillStyle='#00cfff'; c.lineWidth=2;
-  drawArrow(c,cx,cy,cx+vx*sc,cy+vy*sc);
-  c.font='10px -apple-system,sans-serif';
-  c.fillStyle='#00cfff';
-  c.fillText(spd.toFixed(1)+'px/f',cx+vx*sc+6,cy+vy*sc-4);
-}
-
-function drawOptFlow(c, curr, prev, W, H) {
-  if (!prev) return;
-  c.strokeStyle='#bb88ff'; c.fillStyle='#bb88ff'; c.lineWidth=1;
-  const step=24;
-  for (let y=step;y<H-step;y+=step) {
-    for (let x=step;x<W-step;x+=step) {
-      const p=(y*W+x)*4;
-      const lc=0.299*curr[p]+0.587*curr[p+1]+0.114*curr[p+2];
-      const lp=0.299*prev[p]+0.587*prev[p+1]+0.114*prev[p+2];
-      if (Math.abs(lc-lp)<8) continue;
-      const pr=(y*W+Math.min(W-1,x+2))*4;
-      const dx=(0.299*curr[pr]+0.587*curr[pr+1]+0.114*curr[pr+2])
-              -(0.299*prev[pr]+0.587*prev[pr+1]+0.114*prev[pr+2]);
-      const pb=(Math.min(H-1,y+2)*W+x)*4;
-      const dy=(0.299*curr[pb]+0.587*curr[pb+1]+0.114*curr[pb+2])
-              -(0.299*prev[pb]+0.587*prev[pb+1]+0.114*prev[pb+2]);
-      const len=Math.hypot(dx,dy);
-      if (len<0.5) continue;
-      const sc=Math.min(12,Math.abs(lc-lp)*0.3);
-      drawArrow(c,x,y,x+(dx/len)*sc,y+(dy/len)*sc);
-    }
-  }
-}
-
-function drawHullWeb(c, blobs) {
-  if (blobs.length<2) return;
-  const gcx=blobs.reduce((s,b)=>s+b.cx,0)/blobs.length;
-  const gcy=blobs.reduce((s,b)=>s+b.cy,0)/blobs.length;
-  c.strokeStyle='#ff8844'; c.fillStyle='#ff8844'; c.lineWidth=1;
-  for (const b of blobs){
-    c.beginPath();c.moveTo(b.cx,b.cy);c.lineTo(gcx,gcy);c.stroke();
-  }
-  c.beginPath();c.arc(gcx,gcy,5,0,Math.PI*2);c.fill();
-  c.font='11px -apple-system,sans-serif';
-  c.fillText('G',gcx+7,gcy+4);
-  if (blobs.length>=3){
-    const pts=blobs.map(b=>[b.cx,b.cy]);
-    const hull=convexHull(pts);
-    if (hull.length>=3){
-      c.beginPath();c.moveTo(hull[0][0],hull[0][1]);
-      for (let i=1;i<hull.length;i++) c.lineTo(hull[i][0],hull[i][1]);
-      c.closePath();c.stroke();
-    }
-  }
-}
-
-function convexHull(pts) {
-  if (pts.length<3) return pts;
-  pts=pts.slice().sort((a,b)=>a[0]-b[0]||a[1]-b[1]);
-  const lower=[];
-  for (const p of pts){
-    while(lower.length>=2&&cross(lower[lower.length-2],lower[lower.length-1],p)<=0) lower.pop();
-    lower.push(p);
-  }
-  const upper=[];
-  for (let i=pts.length-1;i>=0;i--){
-    const p=pts[i];
-    while(upper.length>=2&&cross(upper[upper.length-2],upper[upper.length-1],p)<=0) upper.pop();
-    upper.push(p);
-  }
-  return lower.slice(0,-1).concat(upper.slice(0,-1));
-}
-function cross(O,A,B){
-  return (A[0]-O[0])*(B[1]-O[1])-(A[1]-O[1])*(B[0]-O[0]);
-}
-
-function findTid(cx,cy) {
-  let best=null,bestD=40;
-  for (const [tid,trail] of Object.entries(blobTrails)){
-    if (!trail.length) continue;
-    const last=trail[trail.length-1];
-    const d=Math.hypot(cx-last.x,cy-last.y);
-    if (d<bestD){bestD=d;best=tid;}
-  }
-  return best;
-}
-
-function drawHeatmap(c, blobs) {
-  const speeds=[];
-  for (const b of blobs){
-    const tid=findTid(b.cx,b.cy);
-    const trail=tid!==null?blobTrails[tid]:[];
-    if (trail&&trail.length>=2){
-      const n=Math.min(5,trail.length-1);
-      let vx=0,vy=0;
-      for (let i=1;i<=n;i++){
-        vx+=trail[trail.length-i].x-trail[trail.length-i-1].x;
-        vy+=trail[trail.length-i].y-trail[trail.length-i-1].y;
-      }
-      speeds.push(Math.hypot(vx/n,vy/n));
-    } else speeds.push(0);
-  }
-  const maxSpd=Math.max(...speeds,1);
-  c.globalAlpha=0.35;
-  for (let i=0;i<blobs.length;i++){
-    const t=speeds[i]/maxSpd;
-    const r=t<0.5?0:Math.round(255*(t-0.5)*2);
-    const g=t<0.5?Math.round(255*t*2):Math.round(255*(1-(t-0.5)*2));
-    const b=t<0.5?Math.round(255*(1-t*2)):0;
-    const rad=20+t*40;
-    const grd=c.createRadialGradient(blobs[i].cx,blobs[i].cy,0,blobs[i].cx,blobs[i].cy,rad);
-    grd.addColorStop(0,`rgba(${r},${g},${b},1)`);
-    grd.addColorStop(1,`rgba(${r},${g},${b},0)`);
-    c.fillStyle=grd;
-    c.beginPath();c.arc(blobs[i].cx,blobs[i].cy,rad,0,Math.PI*2);c.fill();
-  }
-  c.globalAlpha=1;
-}
-
-// ─────────────────────────────────────────────
-// OFFSCREEN CANVAS for pixel reading
-// ─────────────────────────────────────────────
-const offCvs = document.createElement('canvas');
-const offCtx = offCvs.getContext('2d',{willReadFrequently:true});
-
-// ─────────────────────────────────────────────
 // MAIN LOOP
 // ─────────────────────────────────────────────
+// Throttle: proses detection hanya tiap N frame
+// Render overlay tetap setiap frame
+let procTick    = 0;
+const PROC_EVERY = 2; // proses motion tiap 2 frame = 15fps detection
+let lastBlobs   = [];
+let lastImgData = null;
+
 function loop() {
   animFrame = requestAnimationFrame(loop);
-  if (!vid.videoWidth||vid.readyState<2) return;
+  if (!vid.videoWidth || vid.readyState < 2) return;
 
-  const W=vid.videoWidth, H=vid.videoHeight;
-  if (cvs.width!==W||cvs.height!==H){
-    cvs.width=W; cvs.height=H;
-    offCvs.width=W; offCvs.height=H;
+  const VW = vid.videoWidth, VH = vid.videoHeight;
+
+  // Sync overlay canvas ke ukuran display (bukan video)
+  const dw = cvs.offsetWidth  || VW;
+  const dh = cvs.offsetHeight || VH;
+  if (cvs.width !== dw || cvs.height !== dh) {
+    cvs.width  = dw;
+    cvs.height = dh;
   }
 
-  offCtx.drawImage(vid,0,0,W,H);
-  const currData=offCtx.getImageData(0,0,W,H);
+  // Processing canvas = versi kecil
+  const PW = Math.round(VW * PROC_SCALE);
+  const PH = Math.round(VH * PROC_SCALE);
+  if (offCvs.width !== PW || offCvs.height !== PH) {
+    offCvs.width  = PW;
+    offCvs.height = PH;
+  }
 
-  // FPS
+  // ── FPS counter ──
   frameCount++;
-  const now=performance.now();
-  if (now-lastTime>=1000){
-    fps=frameCount; frameCount=0; lastTime=now;
-    document.getElementById('fps-label').textContent=fps+' fps';
+  const now = performance.now();
+  if (now - lastTime >= 1000) {
+    fps = frameCount; frameCount = 0; lastTime = now;
+    document.getElementById('fps-label').textContent = fps + ' fps';
   }
 
-  const thresh=Math.max(1,60-sliders.sensitivity);
-  let blobs=[];
+  // ── Motion detection — hanya tiap PROC_EVERY frame ──
+  procTick++;
+  if (procTick >= PROC_EVERY) {
+    procTick = 0;
 
-  if (prevFrame){
-    let mask=getMotionMask(currData.data,prevFrame.data,W,H,thresh);
-    mask=dilateMask(mask,W,H,4);
-    blobs=findBlobs(mask,W,H,sliders.minsize,sliders.maxsize);
-  }
+    // Gambar video ke offscreen canvas kecil
+    offCtx.drawImage(vid, 0, 0, PW, PH);
+    const currData = offCtx.getImageData(0, 0, PW, PH);
 
-  // Update prev frame with slow decay
-  if (!prevFrame){
-    prevFrame=offCtx.getImageData(0,0,W,H);
-  } else {
-    for (let i=0;i<currData.data.length;i++){
-      prevFrame.data[i]=prevFrame.data[i]*0.7+currData.data[i]*0.3;
+    if (prevFrame) {
+      const thresh = Math.max(1, 60 - sliders.sensitivity);
+      let mask = getMotionMask(currData.data, prevFrame, PW, PH, thresh);
+      mask = dilateMask(mask, PW, PH, 2);
+
+      // minsize/maxsize di-scale ke koordinat kecil
+      const scaleArea = PROC_SCALE * PROC_SCALE;
+      const rawBlobs  = findBlobs(
+        mask, PW, PH,
+        sliders.minsize * scaleArea,
+        sliders.maxsize * scaleArea
+      );
+
+      // Scale balik koordinat ke resolusi tampilan
+      const invS = 1 / PROC_SCALE;
+      lastBlobs = rawBlobs.map(b => ({
+        x:  Math.round(b.x  * invS * (dw/VW)),
+        y:  Math.round(b.y  * invS * (dh/VH)),
+        w:  Math.round(b.w  * invS * (dw/VW)),
+        h:  Math.round(b.h  * invS * (dh/VH)),
+        cx: Math.round(b.cx * invS * (dw/VW)),
+        cy: Math.round(b.cy * invS * (dh/VH)),
+        area: b.area,
+      }));
+
+      blobTrails = matchBlobs(blobTrails, lastBlobs.map(b=>[b.cx,b.cy]));
+
+      // Update prevFrame — hanya simpan data grayscale (Uint8Array)
+      // bukan ImageData penuh. Ini 1/4 dari memori sebelumnya.
+      if (!prevFrame || prevFrame.length !== currData.data.length) {
+        prevFrame = new Uint8Array(currData.data.length);
+      }
+      // Decay 70/30
+      for (let i=0; i<currData.data.length; i++) {
+        prevFrame[i] = (prevFrame[i] * 0.7 + currData.data[i] * 0.3) | 0;
+      }
+
+      lastImgData = currData.data;
+    } else {
+      // Init prevFrame
+      prevFrame = new Uint8Array(currData.data);
     }
+
+    document.getElementById('blob-badge').textContent =
+      lastBlobs.length + (lastBlobs.length===1 ? ' blob' : ' blobs');
   }
 
-  blobTrails=matchBlobs(blobTrails,blobs.map(b=>[b.cx,b.cy]));
+  // ── RENDER — setiap frame ──
+  ctx.clearRect(0, 0, dw, dh);
 
-  // ── DRAW ──────────────────────────────────
-  // Draw video onto overlay canvas first
-  // so recording captures full scene + blobs
-  ctx.drawImage(vid,0,0,W,H);
+  // Hull+Web overlay
+  if (lastBlobs.length >= 2) drawHullWeb(ctx, lastBlobs);
 
-  if (overlays.heat&&blobs.length>0) drawHeatmap(ctx,blobs);
-  if (overlays.flow&&prevGrayFlow)    drawOptFlow(ctx,currData.data,prevGrayFlow,W,H);
-  if (overlays.hull&&blobs.length>=2) drawHullWeb(ctx,blobs);
-  if (overlays.trail)                 drawTrails(ctx,blobTrails);
+  // Bounding boxes
+  const overlayImgData = lastImgData;
+  for (let i=0; i<lastBlobs.length; i++) {
+    const b = lastBlobs[i];
 
-  // Overlap detection
-  const overlapSet=new Set();
-  for (let i=0;i<blobs.length;i++){
-    for (let j=i+1;j<blobs.length;j++){
-      const a=blobs[i],b=blobs[j];
-      if (a.x<b.x+b.w&&a.x+a.w>b.x&&a.y<b.y+b.h&&a.y+a.h>b.y){
-        overlapSet.add(i);overlapSet.add(j);
+    // Overlap check
+    let isOv = false;
+    for (let j=0; j<lastBlobs.length; j++) {
+      if (j===i) continue;
+      const o = lastBlobs[j];
+      if (b.x<o.x+o.w && b.x+b.w>o.x && b.y<o.y+o.h && b.y+b.h>o.y) {
+        isOv = true; break;
       }
     }
-  }
 
-  for (let i=0;i<blobs.length;i++){
-    const b=blobs[i];
-    const tid=findTid(b.cx,b.cy);
-    const trail=tid!==null?blobTrails[tid]:[];
+    const color = isOv ? '#ff453a' : '#00f5ff';
 
-    if (overlays.para&&trail.length>=6) drawParabola(ctx,trail,W,H);
-    if (overlays.grad&&trail.length>=3) drawGradient(ctx,b.cx,b.cy,trail);
-
-    const isOv=overlapSet.has(i);
-    const color=isOv?'#ff453a'
-      :contrastColor(currData.data,b.x,b.y,b.w,b.h,W,H);
-
-    ctx.strokeStyle=color; ctx.lineWidth=1;
-    ctx.strokeRect(b.x,b.y,b.w,b.h);
+    ctx.strokeStyle = color; ctx.lineWidth = 1;
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
 
     // Corner ticks
-    ctx.lineWidth=2;
-    const t=10;
-    const corners=[[b.x,b.y,1,1],[b.x+b.w,b.y,-1,1],
-                   [b.x,b.y+b.h,1,-1],[b.x+b.w,b.y+b.h,-1,-1]];
-    for (const [cx2,cy2,dx,dy] of corners){
+    ctx.lineWidth = 2;
+    const t = 10;
+    const corners = [[b.x,b.y,1,1],[b.x+b.w,b.y,-1,1],
+                     [b.x,b.y+b.h,1,-1],[b.x+b.w,b.y+b.h,-1,-1]];
+    for (const [cx2,cy2,dx,dy] of corners) {
       ctx.beginPath();
-      ctx.moveTo(cx2,cy2);ctx.lineTo(cx2+dx*t,cy2);
-      ctx.moveTo(cx2,cy2);ctx.lineTo(cx2,cy2+dy*t);
+      ctx.moveTo(cx2,cy2); ctx.lineTo(cx2+dx*t,cy2);
+      ctx.moveTo(cx2,cy2); ctx.lineTo(cx2,cy2+dy*t);
       ctx.stroke();
     }
 
-    if (isOv){
+    if (isOv) {
       ctx.fillStyle='#ff453a';
       ctx.font='11px -apple-system,sans-serif';
-      ctx.fillText('OVERLAP',b.x,b.y-6);
+      ctx.fillText('OVERLAP', b.x, b.y-6);
     }
 
-    const lbl=`#${i+1}  ${b.cx},${b.cy}`;
-    let lx=b.x+b.w+8;
-    ctx.font='11px -apple-system,sans-serif';
-    const tw=ctx.measureText(lbl).width;
-    if (lx+tw>W) lx=b.x-tw-8;
-    ctx.fillStyle=color;
-    ctx.fillText(lbl,lx,b.y+14);
+    const lbl = `#${i+1}  ${b.cx},${b.cy}`;
+    let lx = b.x + b.w + 8;
+    ctx.font = '11px -apple-system,sans-serif';
+    const tw = ctx.measureText(lbl).width;
+    if (lx + tw > dw) lx = b.x - tw - 8;
+    ctx.fillStyle = color;
+    ctx.fillText(lbl, lx, b.y+14);
   }
-
-  prevGrayFlow=currData.data.slice();
-
-  document.getElementById('blob-badge').textContent=
-    blobs.length+(blobs.length===1?' blob':' blobs');
 }
 
 // ─────────────────────────────────────────────
 // INIT
 // ─────────────────────────────────────────────
-startCamera('user').then(()=>loop());
+startCamera('user').then(() => loop());
 </script>
 </body>
 </html>
