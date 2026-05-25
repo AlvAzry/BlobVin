@@ -382,9 +382,8 @@ const sliders = {
 // ─────────────────────────────────────────────
 const vid = document.getElementById('vid');
 const cvs = document.getElementById('overlay');
+// alpha:false + willReadFrequently:false — canvas ini WRITE ONLY untuk recording
 const ctx = cvs.getContext('2d', { alpha: false });
-// Hapus willReadFrequently dari overlay ctx —
-// overlay tidak perlu dibaca, hanya ditulis
 
 async function startCamera(facing) {
   if (stream) stream.getTracks().forEach(t => t.stop());
@@ -711,13 +710,13 @@ function loop() {
 
   const VW = vid.videoWidth, VH = vid.videoHeight;
 
-  // Sync overlay canvas ke ukuran display (bukan video)
-  const dw = cvs.offsetWidth  || VW;
-  const dh = cvs.offsetHeight || VH;
-  if (cvs.width !== dw || cvs.height !== dh) {
-    cvs.width  = dw;
-    cvs.height = dh;
+  // Canvas HARUS sama persis dengan resolusi video agar
+  // recording menangkap frame video + tracking (bukan hitam)
+  if (cvs.width !== VW || cvs.height !== VH) {
+    cvs.width  = VW;
+    cvs.height = VH;
   }
+  const dw = VW, dh = VH;
 
   // Processing canvas = versi kecil
   const PW = Math.round(VW * PROC_SCALE);
@@ -757,15 +756,15 @@ function loop() {
         sliders.maxsize * scaleArea
       );
 
-      // Scale balik koordinat ke resolusi tampilan
+      // Scale balik koordinat ke resolusi VIDEO (bukan display)
       const invS = 1 / PROC_SCALE;
       lastBlobs = rawBlobs.map(b => ({
-        x:  Math.round(b.x  * invS * (dw/VW)),
-        y:  Math.round(b.y  * invS * (dh/VH)),
-        w:  Math.round(b.w  * invS * (dw/VW)),
-        h:  Math.round(b.h  * invS * (dh/VH)),
-        cx: Math.round(b.cx * invS * (dw/VW)),
-        cy: Math.round(b.cy * invS * (dh/VH)),
+        x:  Math.round(b.x  * invS),
+        y:  Math.round(b.y  * invS),
+        w:  Math.round(b.w  * invS),
+        h:  Math.round(b.h  * invS),
+        cx: Math.round(b.cx * invS),
+        cy: Math.round(b.cy * invS),
         area: b.area,
       }));
 
@@ -792,7 +791,9 @@ function loop() {
   }
 
   // ── RENDER — setiap frame ──
-  ctx.clearRect(0, 0, dw, dh);
+  // Render video ke canvas DULU — ini yang membuat recording tidak hitam
+  // sekaligus menggantikan clearRect (video menutupi frame sebelumnya)
+  ctx.drawImage(vid, 0, 0, VW, VH);
 
   // Hull+Web overlay
   if (lastBlobs.length >= 2) drawHullWeb(ctx, lastBlobs);
